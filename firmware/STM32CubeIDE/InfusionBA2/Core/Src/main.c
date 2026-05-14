@@ -118,6 +118,21 @@
 #define ALARM_BEEP_HZ       2500U
 #define ALARM_BEEP_ON_MS     100U
 #define ALARM_BEEP_OFF_MS    180U     /* 4 Hz at the alarm rate */
+
+/* 2026-05-14 PM bench: raw beam waveform capture for offline algorithm
+   exploration. Background §17 of docs/limitations.md treats threshold-time
+   chord measurement as architecturally unable to deliver position-invariant
+   volume; this build adds the missing dimension (raw photodiode shape) so
+   the hypothesis can be tested against real waveform data. Optimized
+   polled (register-level CHSELR/ADSTART, not DMA) — keeps existing edge-
+   detection FSM intact; DMA refactor reserved for a follow-up flash if
+   shape resolution proves insufficient. Sample rate ~5 µs/pair (~200
+   kHz/beam, 6× the previous 30 µs/pair), window ~10 ms, dump ~225 ms at
+   2 Mbps baud. */
+#define ENABLE_RAW_CAPTURE      1
+#define RAW_BUF_DEPTH        1024U     /* 8 kB at 8 bytes/sample (halved from 2048 after baud reverted to 921600) */
+#define RAW_PRE_SAMPLES       256U     /* ~1.3 ms pre-trigger context */
+#define RAW_POST_SAMPLES      768U     /* ~3.8 ms post-trigger — clean ~2 ms drop pulse fits; 7 ms umbilical truncated */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -166,18 +181,29 @@ typedef struct {
   uint32_t call_count;
   uint32_t last_status;     /* HAL_StatusTypeDef */
   uint32_t last_err_code;   /* huart1.ErrorCode */
+  uint32_t bytes_inner;     /* incremented INSIDE the for loop body — should equal bytes_sent */
+  uint32_t calls_len0;
+  uint32_t calls_lengt0;
 } uart_diag_t;
-uart_diag_t uart_diag __attribute__((used)) = { .magic = 0xD11D0002U };
+uart_diag_t uart_diag __attribute__((used)) = { .magic = 0xD11D0003U };
 
 static void uart_send(const char *s, uint16_t len)
 {
-  HAL_StatusTypeDef st = HAL_UART_Transmit(&huart1, (uint8_t *)s, len, 50U);
-  uart_diag.call_count++;
-  uart_diag.last_status = (uint32_t)st;
-  uart_diag.last_err_code = huart1.ErrorCode;
-  if (st == HAL_OK) {
-    uart_diag.bytes_sent += len;
+  if (len == 0U) {
+    uart_diag.calls_len0++;
+  } else {
+    uart_diag.calls_lengt0++;
   }
+  for (uint16_t i = 0; i < len; ++i) {
+    while (!(USART1->ISR & USART_ISR_TXE_TXFNF)) { /* spin */ }
+    USART1->TDR = (uint8_t)s[i];
+    uart_diag.bytes_inner++;   /* increments per-byte INSIDE the loop */
+  }
+  while (!(USART1->ISR & USART_ISR_TC)) { /* spin */ }
+  uart_diag.call_count++;
+  uart_diag.bytes_sent += len;
+  uart_diag.last_status = 0U;
+  uart_diag.last_err_code = 0U;
 }
 
 static void uart_send_str(const char *s)
@@ -322,6 +348,28 @@ static uint32_t         last_drop_ms   = 0;   /* updated on every kept drop  */
 static char     cmd_buf[CMD_BUF_SZ];
 static uint8_t  cmd_len = 0U;
 
+#if ENABLE_RAW_CAPTURE
+/* Raw-capture ring buffer. Always-on background fill — every main-loop
+   sampling iteration appends one (t_us, top_adc, bot_adc) triplet. When
+   tT_in latches, raw_trigger_idx records the slot of the trigger sample
+   and raw_post_count counts subsequent samples until RAW_POST_SAMPLES
+   are collected; at that point raw_dump_pending is set and the main
+   loop's drop-completion path dumps the surrounding window over UART. */
+typedef struct {
+  uint32_t t_us;
+  uint16_t top;
+  uint16_t bot;
+} raw_sample_t;
+
+static raw_sample_t raw_buf[RAW_BUF_DEPTH];
+static uint16_t     raw_head         = 0U;     /* next-write slot index */
+static uint8_t      raw_armed        = 0U;     /* 1 between tT_in and dump completion */
+static uint16_t     raw_trigger_idx  = 0U;     /* slot of the sample that crossed top_thresh_high */
+static uint32_t     raw_t_trigger_us = 0U;     /* TIM2 µs at that crossing */
+static uint16_t     raw_post_count   = 0U;     /* post-trigger samples collected */
+static uint8_t      raw_dump_pending = 0U;     /* main loop should dump now */
+#endif
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -347,6 +395,11 @@ static float compute_Q_mLph(uint32_t now_ms);
 static uint32_t interp_edge_us(uint16_t v_prev, uint32_t t_prev_us,
                                uint16_t v_now,  uint32_t t_now_us,
                                uint16_t v_threshold);
+#if ENABLE_RAW_CAPTURE
+static void adc_read_pair_fast(uint16_t *top, uint16_t *bot,
+                               uint32_t *top_us, uint32_t *bot_us);
+static void dump_raw_window(uint32_t t_ms, uint32_t drop_n);
+#endif
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -406,8 +459,12 @@ int main(void)
   TIM2->CR1 = TIM_CR1_CEN;
 
   HAL_ADCEx_Calibration_Start(&hadc1);
-  /* Bump common sampling time to 160.5 cycles (~5 µs) so VREFINT and
-     TEMPSENSOR settle. .ioc default of 1.5 cycles is too fast for them.   */
+  /* 2026-05-14 PM bench: REVERTED to 160.5 cycles. At 3.5 cycles the
+     photodiode TIA evidently didn't settle properly — runtime ADC reads
+     dropped from ~3593 (boot cal) to ~3272, and drops never crossed the
+     +100 threshold. Trading sample rate for signal integrity. Per-pair
+     rate now back to ~12 µs (still 2× the polled-HAL ~30 µs of the
+     original firmware via the register-level read path). */
   MODIFY_REG(ADC1->SMPR, ADC_SMPR_SMP1, ADC_SAMPLETIME_160CYCLES_5);
 
   LCD_Init();
@@ -497,6 +554,11 @@ int main(void)
                   "<top_raw>,<bot_raw>\r\n");
     uart_send_str("# EVT,<t_ms>,DROP_REJECT,reason=<r>,dt_us=...,tau_us=...,"
                   "v_mmps_tenths=...,d_mm_tenths=...,V_uL_tenths=...\r\n");
+#if ENABLE_RAW_CAPTURE
+    uart_send_str("# DROP_RAW_BEGIN,<t_ms>,<drop_N>,<sample_count>,<t_first_us>,<t_last_us>,<t_trigger_us>\r\n"
+                  "# RAW,<t_us>,<top_adc>,<bot_adc>  (x sample_count)\r\n"
+                  "# DROP_RAW_END,<drop_N>\r\n");
+#endif
     log_msg("BOOT done");
     char tmp[48];
     snprintf(tmp, sizeof(tmp), "thresh T_hi=%u B_hi=%u",
@@ -504,6 +566,27 @@ int main(void)
     log_msg(tmp);
   }
   LCD_Clear();
+
+#if ENABLE_RAW_CAPTURE
+  /* 2026-05-14 PM bench fix: boot calibration's adc_read() calls
+     HAL_ADC_Stop at the end of each pair, which clears ADEN. We need
+     ADC enabled persistently for register-level adc_read_pair_fast().
+     Also CRITICAL: HAL_ADC_Init sets CFGR1.CHSELRMOD=1 (fully-configurable
+     sequencer mode), which makes CHSELR a sequence-of-channels encoding
+     instead of a bit-mask. Switch CHSELRMOD=0 (bit-mask mode) so our
+     register-level CHSELR=(1<<channel) writes mean what we expect.
+     CHSELRMOD can only be modified when ADEN=0. */
+  ADC1->CFGR1 &= ~ADC_CFGR1_CHSELRMOD;
+  ADC1->ISR = ADC_ISR_ADRDY;   /* clear ADRDY (write-1-to-clear) */
+  ADC1->CR |= ADC_CR_ADEN;     /* enable ADC */
+  {
+    uint32_t adrdy_deadline = HAL_GetTick() + 50U;
+    while (!(ADC1->ISR & ADC_ISR_ADRDY)
+           && (int32_t)(adrdy_deadline - HAL_GetTick()) > 0) {
+      /* spin */
+    }
+  }
+#endif
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
@@ -730,12 +813,36 @@ int main(void)
       log_msg("BTN MUTE 60s");
     }
 
-    /* Sample both photodiode channels with their own timestamps so the
-       interpolation reflects when each one actually converted. */
-    uint32_t top_sample_us = TIM2->CNT;
-    uint16_t top_raw       = adc_read(ADC_CHANNEL_1);   /* PA1 — TOP */
-    uint32_t bot_sample_us = TIM2->CNT;
-    uint16_t bot_raw       = adc_read(ADC_CHANNEL_4);   /* PA4 — BOT */
+    /* Sample both photodiode channels. 2026-05-14 PM bench: switched from
+       per-channel HAL adc_read() to register-level adc_read_pair_fast()
+       for ~5 µs/pair (was ~30 µs). Each sample is appended to the raw
+       capture ring buffer; the post-tT_in countdown caps post-trigger
+       fill at RAW_POST_SAMPLES, after which raw_dump_pending is set so
+       the drop-completion path can dump the surrounding window. */
+    uint32_t top_sample_us;
+    uint32_t bot_sample_us;
+    uint16_t top_raw;
+    uint16_t bot_raw;
+#if ENABLE_RAW_CAPTURE
+    adc_read_pair_fast(&top_raw, &bot_raw, &top_sample_us, &bot_sample_us);
+
+    raw_buf[raw_head].t_us = top_sample_us;
+    raw_buf[raw_head].top  = top_raw;
+    raw_buf[raw_head].bot  = bot_raw;
+    raw_head = (uint16_t)((raw_head + 1U) % RAW_BUF_DEPTH);
+
+    if (raw_armed && raw_post_count < RAW_POST_SAMPLES) {
+      raw_post_count++;
+      if (raw_post_count >= RAW_POST_SAMPLES) {
+        raw_dump_pending = 1U;
+      }
+    }
+#else
+    top_sample_us = TIM2->CNT;
+    top_raw       = adc_read(ADC_CHANNEL_1);   /* PA1 — TOP */
+    bot_sample_us = TIM2->CNT;
+    bot_raw       = adc_read(ADC_CHANNEL_4);   /* PA4 — BOT */
+#endif
 
     /* TOP edge detection (hysteretic) with sub-sample timestamp interp */
     if (!top_in && top_raw > top_thresh_high) {
@@ -744,6 +851,17 @@ int main(void)
         tT_in = interp_edge_us(prev_top_raw, prev_top_us,
                                top_raw, top_sample_us, top_thresh_high);
         top_raw_at_in = top_raw;
+#if ENABLE_RAW_CAPTURE
+        /* Arm raw capture at TOP entry. raw_head is next-write; the
+           sample that just crossed top_thresh_high lives at raw_head-1.
+           Lock that slot as the trigger anchor; subsequent samples will
+           fill post-trigger and the drop-completion path dumps. */
+        raw_trigger_idx  = (uint16_t)((raw_head + RAW_BUF_DEPTH - 1U) % RAW_BUF_DEPTH);
+        raw_t_trigger_us = raw_buf[raw_trigger_idx].t_us;
+        raw_post_count   = 0U;
+        raw_dump_pending = 0U;
+        raw_armed        = 1U;
+#endif
       }
     } else if (top_in && top_raw < top_thresh_low) {
       top_in = 0;
@@ -841,6 +959,20 @@ int main(void)
                            last_drop.vol_tenths,
                            state_int, Q_cmLph,
                            top_raw_at_in, bot_raw_at_in);
+#if ENABLE_RAW_CAPTURE
+              /* Emit the raw beam window for this accepted drop. Blocking
+                 ~225 ms at 2 Mbps; the main-loop blackout is bounded by
+                 dump bandwidth, and REARM_CLEAR_MS is auto-satisfied
+                 since now_ms advances during uart_send. raw_post_count
+                 may be < RAW_POST_SAMPLES for short pulses — dump_raw_window
+                 emits whatever post-fill is available. */
+              if (raw_armed) {
+                dump_raw_window(now_ms, drops_accepted);
+              }
+              raw_armed        = 0U;
+              raw_post_count   = 0U;
+              raw_dump_pending = 0U;
+#endif
             }
 
             if (session_state == STATE_CAL) {
@@ -910,6 +1042,16 @@ int main(void)
         top_raw_at_in = 0;
         bot_raw_at_in = 0;
         both_clear_ms = now_ms;
+#if ENABLE_RAW_CAPTURE
+        /* Disarm raw capture on every drop completion (accept + both reject
+           paths). For accept, the dump has already fired upstream; here we
+           just clear the latch. For reject, the post-tT_in samples are
+           discarded — we don't dump rejected drops (saves bandwidth and
+           keeps the dataset clean of guard-failed records). */
+        raw_armed        = 0U;
+        raw_post_count   = 0U;
+        raw_dump_pending = 0U;
+#endif
       }
     }
 
@@ -1320,7 +1462,7 @@ static void MX_USART1_UART_Init(void)
 
   /* USER CODE END USART1_Init 1 */
   huart1.Instance = USART1;
-  huart1.Init.BaudRate = 115200;
+  huart1.Init.BaudRate = 115200;    /* 2026-05-14 PM bench: settled on 115200 — PING/response confirmed working on this rig's CP210x. Per-drop raw dump ~22 kB takes ~2 s at this rate, so bench drip rate kept ~20 mL/h to give >2 s inter-drop spacing. Trade dump bandwidth for chain reliability. */
   huart1.Init.WordLength = UART_WORDLENGTH_8B;
   huart1.Init.StopBits = UART_STOPBITS_1;
   huart1.Init.Parity = UART_PARITY_NONE;
@@ -1413,6 +1555,80 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+#if ENABLE_RAW_CAPTURE
+/* Register-level pair-read of TOP (CH1, PA1) and BOT (CH4, PA4). Bypasses
+   HAL_ADC_ConfigChannel / Start / PollForConversion / Stop overhead (each
+   of which was adding 1-5 µs of bookkeeping per channel). Direct CHSELR
+   write + ADSTART + EOC poll + DR read. At 3.5-cycle sample time the ADC
+   conversion itself is ~500 ns; total per-pair ~1-2 µs ADC + ~3-4 µs of
+   surrounding loop logic = ~5 µs/pair (~200 kHz/beam, 6× the previous
+   ~30 µs/pair rate).
+
+   Assumes the ADC is in CubeMX default config: ContinuousConvMode=DISABLE,
+   ScanConvMode=DISABLE, NbrOfConversion=1 → each ADSTART produces exactly
+   one conversion in CHSELR-bit order. SMP1 must be set to a fast value
+   (we use 3.5 cycles, set post-calibration in main()). */
+static void adc_read_pair_fast(uint16_t *top, uint16_t *bot,
+                               uint32_t *top_us, uint32_t *bot_us)
+{
+  /* CH1 — TOP / PA1. */
+  ADC1->CHSELR = (1U << 1);
+  *top_us = TIM2->CNT;
+  ADC1->CR |= ADC_CR_ADSTART;
+  while (!(ADC1->ISR & ADC_ISR_EOC)) { /* spin until conversion done */ }
+  *top = (uint16_t)(ADC1->DR & 0x0FFFU);   /* reading DR auto-clears EOC */
+
+  /* CH4 — BOT / PA4. */
+  ADC1->CHSELR = (1U << 4);
+  *bot_us = TIM2->CNT;
+  ADC1->CR |= ADC_CR_ADSTART;
+  while (!(ADC1->ISR & ADC_ISR_EOC)) { }
+  *bot = (uint16_t)(ADC1->DR & 0x0FFFU);
+}
+
+/* Dump the surrounding pre/post-trigger window over UART. Format:
+     DROP_RAW_BEGIN,<t_ms>,<drop_N>,<sample_count>,<t_first_us>,<t_last_us>,<t_trigger_us>
+     RAW,<t_us>,<top>,<bot>          x sample_count
+     DROP_RAW_END,<drop_N>
+   raw_post_count may be < RAW_POST_SAMPLES when the drop completes
+   faster than the post-trigger fill — emit whatever has been collected,
+   so short clean drops dump fewer bytes and contaminated drops dump more.
+   Blocking via uart_send (HAL_UART_Transmit with 50 ms per-call timeout). */
+static void dump_raw_window(uint32_t t_ms, uint32_t drop_n)
+{
+  uint16_t pre  = RAW_PRE_SAMPLES;
+  uint16_t post = raw_post_count;
+  if (post > RAW_POST_SAMPLES) post = RAW_POST_SAMPLES;
+  uint16_t total = (uint16_t)(pre + post);
+
+  uint16_t start   = (uint16_t)((raw_trigger_idx + RAW_BUF_DEPTH - pre) % RAW_BUF_DEPTH);
+  uint16_t end_idx = (uint16_t)((start + total - 1U) % RAW_BUF_DEPTH);
+  uint32_t t_first = raw_buf[start].t_us;
+  uint32_t t_last  = raw_buf[end_idx].t_us;
+
+  char buf[80];
+  int n = snprintf(buf, sizeof(buf),
+                   "DROP_RAW_BEGIN,%lu,%lu,%u,%lu,%lu,%lu\r\n",
+                   (unsigned long)t_ms, (unsigned long)drop_n,
+                   (unsigned)total,
+                   (unsigned long)t_first, (unsigned long)t_last,
+                   (unsigned long)raw_t_trigger_us);
+  if (n > 0) uart_send(buf, (uint16_t)n);
+
+  for (uint16_t i = 0; i < total; ++i) {
+    uint16_t idx = (uint16_t)((start + i) % RAW_BUF_DEPTH);
+    int m = snprintf(buf, sizeof(buf), "RAW,%lu,%u,%u\r\n",
+                     (unsigned long)raw_buf[idx].t_us,
+                     (unsigned)raw_buf[idx].top,
+                     (unsigned)raw_buf[idx].bot);
+    if (m > 0) uart_send(buf, (uint16_t)m);
+  }
+
+  n = snprintf(buf, sizeof(buf), "DROP_RAW_END,%lu\r\n", (unsigned long)drop_n);
+  if (n > 0) uart_send(buf, (uint16_t)n);
+}
+#endif
+
 static uint16_t adc_read(uint32_t channel)
 {
   ADC_ChannelConfTypeDef sConfig = {0};
